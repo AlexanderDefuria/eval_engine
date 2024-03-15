@@ -7,7 +7,7 @@ from runtime.evaluation import accuracy
 
 
 type SearchSpace = Dict[str, Dimension]
-type ModelDict = dict[str, BaseEstimator | SearchSpace]
+type ModelDict = dict[str, dict[str, Any]] 
 
 
 """EXAMPLES
@@ -44,15 +44,15 @@ class Model:
                  estimator: BaseEstimator, 
                  search_spaces: SearchSpace, 
                  scorer: Optional[Callable | str] = None,
+                 skip_resample: bool = False,
                  **kwargs) -> None:
         self.estimator = estimator
         self.search_spaces = search_spaces
         self.name = name
         self.scorer = scorer if scorer else accuracy
+        self.skip_resample = skip_resample
 
         if self.search_spaces is not None:
-            # print("Using BayesSearchCV")
-           #  print("Scorer:", scorer)
             self.model = BayesSearchCV(estimator=self.estimator, 
                                     search_spaces=self.search_spaces,
                                     scoring=scorer, 
@@ -112,10 +112,12 @@ class Model:
         assert "estimator" in json, "Model JSON must contain an estimator"
         assert hasattr(json["estimator"], "fit") and callable(json["estimator"].fit), "Estimator must have a fit method"
         assert hasattr(json["estimator"], "predict") and callable(json["estimator"].predict), "Estimator must have a predict method"
-        # assert hasattr(json["estimator"], "score") and callable(json["estimator"].score), "Estimator must have a score method"
-        assert json.keys() == {"estimator", "search_spaces", "scorer"}, "Model JSON must only contain estimator, search_spaces, and scorer"
 
-        return cls(name, json["estimator"], json["search_spaces"], json["scorer"])
+        if "skip_resample" not in json:
+            json["skip_resample"] = False
+                
+        
+        return cls(name, json["estimator"], json["search_spaces"], json["scorer"], skip_resample=json["skip_resample"])
     
 
 class TestModel:

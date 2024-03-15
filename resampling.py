@@ -1,8 +1,7 @@
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Callable, Optional, List
 
-from pandas import DataFrame
-
+type ResamplerList = Optional[List[Resampler | None | Callable]]
 
 class Resampler:
     """
@@ -29,7 +28,7 @@ class Resampler:
             self.name = str(self.resampler).strip("() ").split(".")[-1]
 
     def __str__(self):
-        return self.name
+        return self.name if self.name else str(self.resampler)
 
     def __repr__(self):
         """
@@ -40,31 +39,12 @@ class Resampler:
     
     def __call__(self, X, y, output: Optional[Path] = None):
         # TODO ? - If using outlier detection classifier, must only train on positive class.
+
+        # Make sure the resampler can call fit_resample if it is defined as an actual resampler
+        if self.resampler is not None:
+            assert hasattr(self.resampler, "fit_resample"), "Resampler must have a fit_resample method"
+            assert callable(self.resampler.fit_resample), "Resampler's fit_resample method must be callable"
+        # Make sure the resampler can be called with the given parameters
         resampled = self.resampler.fit_resample(X, y) if self.resampler else (X, y)
 
-        if output:
-            assert output.is_file, "Output path must be a file"
-            output.mkdir(parents=True, exist_ok=True)
-            data = DataFrame(resampled).transpose()
-            data.columns = ["X", "y"]
-            if ".pkl" in output.suffix or ".pickle" in output.suffix:
-                data.pickle(output)
-            else:
-                data.to_csv(output)
-        
         return resampled
-    
-    @classmethod
-    def from_json(cls, json: Dict[str, str]):
-        assert "name" in json, "Resampler JSON must contain a name"
-        assert "params" in json, "Resampler JSON must contain params"
-        assert json.keys() == {"name", "params"}, "Resampler JSON must only contain name and params"
-
-        return cls(**json)
-    
-
-class TestResampler:
-
-    def test_serde():
-        # TODO - Implement
-        pass

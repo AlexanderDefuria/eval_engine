@@ -11,7 +11,7 @@ class TraditionalScreen:
         
         Uses the TSH_I (RAW) column to determine if a patient has CH using the existing cutoff.
         """
-        return [1 if x[self.tsh_index] > self.cutoff else 0 for x in X]
+        return [1 if x[self.tsh_index] >= self.cutoff else 0 for x in X]
 
     def fit(self, X: pd.DataFrame, y: pd.Series) -> None:
         return None

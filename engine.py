@@ -1,23 +1,23 @@
-
 """
     This file contains the engine of the project.
     It is what runs the models and the training, recording the entire process for later evaluation.
 """
 
-from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
 import os
-from pathlib import Path
-from typing import List, Optional, Tuple
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import re
+from typing import Dict, List, Tuple
+
 import numpy as np
-from sklearn.model_selection import StratifiedKFold
+import requests
+from pandas import DataFrame
+from sklearn.model_selection import BaseCrossValidator, StratifiedKFold
+
+from runtime.evaluation import *
 from runtime.model import Model, ModelDict
 from runtime.resampling import *
 from runtime.storage import Storage
-from runtime.evaluation import *
-from pandas import DataFrame
-import requests
-import pickle
 
 
 class Engine:
@@ -46,12 +46,13 @@ class Engine:
     kwargs: Additional keyword arguments.
     """
     output_lock = multiprocessing.Lock()
+    log_lock = multiprocessing.Lock()
 
-    def __init__(self, 
-                models: List[Model] | ModelDict, 
-                resamplers: Optional[List[Resampler] | List[None]] = None,
-                scorers: Dict[str, str | Callable] = {"accuracy": accuracy},
-                data_file: Path = Path("data"),
+    def __init__(self,
+                models: List[Model] | ModelDict,
+                resamplers: ResamplerList,
+                scorers: Dict[str, str | Callable] | Metric,
+                tag: str,
                 X: np.ndarray = np.array([]),
                 y: np.ndarray = np.array([]),
                 verbosity: int = 1,
@@ -59,37 +60,38 @@ class Engine:
                 max_workers: int = 1,
                 output_name: str = "results",
                 output_format: str = "csv",
-                overwrite: bool = False,
-                tag: Optional[str] = None,
                 disable_bayes_search: bool = False,
                 cross_validate: bool = True,
-                cross_validator: StratifiedKFold = StratifiedKFold(n_splits=5, random_state=None),
-                **kwargs):
+                save_probabilities: bool = True,
+                cross_validators: List[BaseCrossValidator] = [StratifiedKFold(n_splits=5, random_state=None)]):
 
         # Handle data configuration tasks
-        self.path = data_file
         self.X = X
         self.y = y
-        self.logging = verbosity
+        self.verbosity = verbosity
         self.records_dir = records_dir
         self.max_workers = max_workers
         self.output_name = output_name
         self.output_format = output_format
-        self.cross_validator = cross_validator
+        self.cross_validators = cross_validators
         self.cross_validate = cross_validate
         self.resamplers: List[Resampler] = []
         self.tag = tag
+        self.save_probabilities = save_probabilities
+        self.log_file = self.records_dir / "log.txt"
+
         try:
             # Handle model configuration tasks and creation of models Objects.
             self._load_models(models, scorers, disable_bayes_search=disable_bayes_search)
             # Handle loading of resamplers into Resampler objects
             self._load_resamplers(resamplers)
             # Handle output configuration tasks (create output file if it doesn't exist or overwrite if desired)
-            self._setup_output(overwrite=overwrite, output_format=output_format)
+            self._setup_output()
+
         except Exception as e:
-            print(f"Error while setting up engine: {e}")
-            self.telegram(f"Error while setting up engine: {e}")
+            self._log(f"Error while setting up engine: {e}")
             raise e
+
 
     def run(self) -> None:
         """
@@ -102,41 +104,42 @@ class Engine:
         Returns: 
         self: The engine instance.
         """
-        executor = ProcessPoolExecutor(max_workers=self.max_workers)
+        # Dispatch the training tasks.
+        executor = ProcessPoolExecutor(max_workers=self.max_workers )
         futures = []
-        self.telegram(f"Started {self.tag}")
-        for resampler in self.resamplers:
-            for model in self.models:
-                if self.max_workers == 1:
-                    self._train(model, resampler)
-                else:
-                    futures.append(executor.submit(self._train, model, resampler))
+        for cross_validator in self.cross_validators:
+            for resampler in self.resamplers:
+                for model in self.models:
+                    if self.max_workers == 1:
+                        self._train(model, resampler, cross_validator)
+                    else:
+                        futures.append(executor.submit(self._train, model, resampler, cross_validator))
 
-        # TODO - Add progress bar and error checking here
+        # Wait for tasks to finish 
+        # TODO Monitor progress and ensure progress is being made.
         for future in as_completed(futures):
             try:
                 future.result()
             except Exception as e:
-                print(f"Error while training: {e}")
-                self.telegram("Error while training: {e}")
+                self._log(f"Error while training. {self.tag}: {e}")
                 raise e
-        self.telegram(f"Done Training {self.output_file}")
+
+        executor.shutdown()
+        self._log(f"Done Training {self.tag}.")
+
 
     def telegram(self, msg: str):
-        chat_id = "6556340412"
         try:
+            chat_id = "6556340412"
             token = os.environ.get('TELEGRAM_API_TOKEN')
-        except:
-            token = None
-        
-        if token: 
             url = f"https://api.telegram.org/bot{token}"
             params = {"chat_id": chat_id, "text": msg}
-            if self.logging < 5 and msg != "Done Training.":
-                return
             r = requests.get(url + "/sendMessage", params=params)
-
-    def _train(self, model: Model, resampler: Resampler) -> None:
+        except:
+            token = None
+  
+  
+    def _train(self, model: Model, resampler: Resampler, cross_validator: BaseCrossValidator) -> None:
         """
         Trains the provided model using the provided resampler and the instance's data.
 
@@ -144,26 +147,41 @@ class Engine:
         model (Model): The model to be trained.
         resampler (Resampler): The resampler to be used for resampling the training data.
         """
-        iterator = self.cross_validator.split(self.X, self.y)
-        if self.cross_validate == False:
-            iterator = [(np.arange(len(self.X)), np.arange(len(self.X)))]
-        for cv_round, (train_i, test_i) in enumerate(iterator):
-            X_train, y_train = self.X[train_i,:], self.y[train_i]
-            X_test, y_test = self.X[test_i,:], self.y[test_i]
-            cv_round = f"cv_{cv_round}"
-            
-            X_train, y_train = resampler(X_train, y_train)
-            model.train(X_train, y_train)
-            predicted = model.predict(X_test)
-            score = model.score(X_test, y_test)
+        try: 
+            iterator = cross_validator.split(self.X, self.y)
+            if self.cross_validate == False or self.cross_validators is None or self.cross_validators == []:
+                iterator = [(np.arange(len(self.X)), np.arange(len(self.X)))]
 
-            # TODO - This could be changed to store every fold in a single file, or every model in a single file.
-            self._log(model, resampler, data=(test_i, y_test, predicted), cv_round=cv_round, score=score)
-            self.telegram(f"""Model: {model}\nResampler: {resampler}\nCV Round: {cv_round}\nScorer: {model.scorer.__name__}\nScore: {score}\n""")
+            for cv_round, (train_i, test_i) in enumerate(iterator):
+                X_train, y_train = self.X[train_i, :], self.y[train_i]
+                X_test, y_test = self.X[test_i, :], self.y[test_i]
+                cv_round = f"cv_{cv_round}"
 
-        self._save_model(model, resampler, model.scorer)
+                if not model.skip_resample:
+                    X_train, y_train = resampler(X_train, y_train)
+                    
+                model.train(X_train, y_train)
+                predicted = model.predict(X_test)
+                score = model.score(X_test, y_test)
 
-    def _log(self, model: Model, resampler: Resampler, data: Tuple, cv_round: str, score: float) -> None:
+                if self.save_probabilities and hasattr(model.model, "predict_proba"):
+                    proba = model.model.predict_proba(X_test)[:, 1]  # type: ignore
+                self._save_data(model, cross_validator, resampler, model.scorer, cv_round, (test_i, y_test, predicted, proba)) # type: ignore
+                self._log(f"""Model: {model}
+                          CV:{cross_validator}
+                          CV Round: {cv_round}
+                          Resampler: {resampler}
+                          Optimization: {model.scorer.__name__}
+                          Score: {score}
+                          Tag: {self.tag}\n""") 
+                self._save_model(model, cross_validator, resampler, model.scorer) # type: ignore
+                
+        except Exception as e:
+            error = f"Error while training {model}_{resampler}_{cross_validator}: {e}"
+            raise Exception(error)
+
+
+    def _log(self, msg: str) -> None:
         """
         Logs the provided data to the output file. TODO - Maybe kill this method or improve it through a rewrite.
 
@@ -173,15 +191,17 @@ class Engine:
         data (Tuple): The data to be saved.
         cv_round (int): The cross-validation round number.
         """
-        if self.logging > 2:
-            print(f"Saving data for {model}_{resampler}_{cv_round}")
-        if self.logging > 1:
-            print(f"{model}_{resampler}_{cv_round} = {score}") 
-        if self.logging > 0:
-            self._save_data(model, resampler, model.scorer, cv_round, data)
+        if self.verbosity >= 5:
+            with self.log_lock:
+                with open(self.log_file, "a") as f:
+                    f.write(msg)
+        if self.verbosity >= 4:
+            self.telegram(msg)
+        if self.verbosity >= 3:
+            print(msg)
 
 
-    def _save_data(self, model: Model, resampler: Resampler, scorer: callable, cv_round: str, data: Tuple, metadata: Optional[dict] = None) -> None:
+    def _save_data(self, model: Model, cross_validator: BaseCrossValidator, resampler: Resampler, scorer: Callable, cv_round: str, data: Tuple) -> None:
         """
         Saves the provided data to a file. The file type is determined by the extension of the output file.
 
@@ -194,23 +214,16 @@ class Engine:
         AssertionError: If the data is not in the correct format.
         AssertionError: If the output file does not have a valid extension.
         """
-        if self.logging <= 0:
-            return # Don't save anything if verbosity is 0 or less.
-        
-        assert type(data) == tuple, "Data must be a tuple."
+        assert type(data) is tuple, "Data must be a tuple."
         assert len(data) > 1, "Data must contain at least 2 elements."
         assert self.output_format in ["csv", "pickle", "both"], "Output type must be valid."
 
         with self.output_lock:
-            if self.tag:
-                directory = self.records_dir / str(resampler) / str(model) / scorer.__name__ / str(self.tag) 
-            else:
-                directory = self.records_dir / str(resampler) / str(model) / scorer.__name__
-
+            cv_name = Storage.cross_validator_name(cross_validator)
+            storage = Storage(self.records_dir, cv_name, str(resampler), str(model), scorer.__name__, self.tag)
             file_name = f"{self.output_name}_{cv_round}"
             df = DataFrame(data).transpose()
-            df = df.set_axis(['index', 'actual', 'predicted'], axis=1)
-            storage = Storage(directory)
+            df = df.set_axis(['index', 'actual', 'predicted', 'proba'], axis=1)
 
             if self.output_format == "both":
                 storage.save_dataframe(df, file_name)
@@ -220,7 +233,8 @@ class Engine:
             else:
                 storage.save_csv(df, file_name)
 
-    def _save_model(self, model: Model, resampler: Resampler, scorer: callable) -> None:
+
+    def _save_model(self, model: Model, cross_validator: BaseCrossValidator, resampler: Resampler, scorer: Callable) -> None:
         """
         Saves the provided model to a file.
 
@@ -228,19 +242,11 @@ class Engine:
         model (Model): The model to be saved.
         resampler (Resampler): The resampler used to generate the model (labelling purposes).
         scorer (str): The scorer used to generate the model (labelling purposes).
-
-        Raises:
-        AssertionError: If the output file does not have a valid extension.
         """
-        if self.logging <= 0:
-            return
         with self.output_lock:
             print(f"Saving model for {model}_{resampler}_{scorer}")
-            if self.tag:
-                directory = self.records_dir / str(resampler) / str(model) / scorer.__name__ / str(self.tag)  
-            else:
-                directory = self.records_dir / str(resampler) / str(model) / scorer.__name__
-            Storage(directory).save_model(model)
+            cv_name = Storage.cross_validator_name(cross_validator)
+            Storage(self.records_dir, cv_name, str(resampler), str(model), scorer.__name__, self.tag).save_model(model)
 
     def _load_models(self, models: List[Model] | ModelDict, scorers: Dict[str, str | Callable], disable_bayes_search: bool = False):
         """
@@ -254,43 +260,49 @@ class Engine:
         self.scorers = scorers
         if type(models) == dict:
             self.models = []
-            for scoring_method  in scorers.values():
+            for scoring_method in scorers.values():
                 for name, json in models.items():
                     json["scorer"] = scoring_method
+                    assert " " not in name, "Model names cannot contain spaces."
+                    assert "/" not in name or "\\" not in name, "Model names cannot contain slashes."
                     self.models.append(Model.from_json(name, json, disable_bayes_search=disable_bayes_search))
         elif type(models) == list:
             self.models = models
 
-
-    def _load_resamplers(self, resamplers: Optional[List[Resampler | None]] = None) -> None:
+    def _load_resamplers(self, resampler_list: ResamplerList = None) -> None:
         """
         Loads the provided resamplers into Resampler objects.
         """
-        resamplers if resamplers else [Resampler("none")]
-        for i, resampler in enumerate(resamplers):
+        resamplers: List[Resampler] = []
+        if resampler_list is None:
+            resampler_list = [None]
+            
+        for resampler in resampler_list:
             if resampler is None:
-                resamplers[i] = Resampler("none")
-            if type(resampler) != Resampler:
-                resamplers[i] = Resampler(resampler=resampler)
-            else: 
-                resamplers[i] = resampler
+                resamplers.append(Resampler("none"))
+            elif type(resampler) == Resampler:
+                resamplers.append(Resampler(resampler=resampler.resampler, **resampler.params))
+            else:
+                resamplers.append(Resampler(resampler=resampler))
+                
         self.resamplers = resamplers
 
-
-    def _setup_output(self, overwrite: bool = False, output_format: str = "h5"):
+    def _setup_output(self):
         """
         Sets up the output directory.
         """
-        
-        self.output_file = (self.records_dir / (str(self.output_name) + '.' + str(output_format))).resolve()
         if not self.records_dir.exists():
             self.records_dir.mkdir()
-        if self.output_file.exists():
-            if overwrite:
-                os.remove(self.output_file)
-            else:
-                raise FileExistsError(f"File {self.output_file} already exists. Use overwrite=True to overwrite it.")
 
-
-
-
+        if not self.log_file.exists():
+            self.log_file.touch()
+            
+    def _format_result(self, model, resampler, cross_validator, scorer, cv_round, score, tag):
+            return f"""Model: {model}
+                    CV: {cross_validator}
+                    CV Round: {cv_round}
+                    Resampler: {resampler}
+                    Optimization: {scorer.__name__}
+                    Score: {score}
+                    Tag: {tag}
+                    """

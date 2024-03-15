@@ -2,14 +2,15 @@ from pathlib import Path
 import pickle
 from typing import Optional
 from pandas import DataFrame
+from sklearn.model_selection import BaseCrossValidator, KFold, RepeatedStratifiedKFold, StratifiedKFold
 from runtime.model import Model
 import os
 
 
 class Storage:
 
-    def __init__(self, path: Path):
-        self.path = path
+    def __init__(self, base_path: Path, cv_name: str, resampler: str, model: str, scorer: str, tag: Optional[str] = None) -> None:
+        self.path = base_path / cv_name / resampler / model / scorer / (tag if tag else '')
         if not self.path.exists():
             os.makedirs(self.path, exist_ok=True)
 
@@ -58,3 +59,18 @@ class Storage:
             raise ValueError('Name should not contain an extension, the Storage class will add it automatically')
         self.path = self.path / f'{name}.csv'
         df.to_csv(self.path, index=False)
+
+    @classmethod
+    def cross_validator_name(cls, cross_validator: BaseCrossValidator) -> str:
+        if cross_validator is None:
+            name = "None"
+        elif type(cross_validator) == StratifiedKFold:
+            name = f"StratifiedKFold_{cross_validator.n_splits}"
+        elif type(cross_validator) == KFold:
+            name = f"KFold_{cross_validator.n_splits}"
+        elif type(cross_validator) == RepeatedStratifiedKFold:
+            name = f"RepeatedStratifiedKFold_{cross_validator.n_repeats}x{cross_validator.cvargs['n_splits']}"
+        else:
+            name = cross_validator.__name__
+        
+        return name

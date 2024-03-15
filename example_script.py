@@ -42,7 +42,6 @@ engine = Engine(MODELS,
                 X=X,
                 y=y,
                 max_workers=40,
-                verbosity=5,
-                overwrite=True)
+                verbosity=5)
 
 engine.run()
